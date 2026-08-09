@@ -177,4 +177,39 @@ final class AsyncUtilsTests: XCTestCase {
       XCTAssert(error is OperationError, "Received unexpected error \(error)")
     }
   }
+
+  func testWithCancellableCheckedThrowingContinuationReturnsResult() async throws {
+    let result = try await withCancellableCheckedThrowingContinuation { (continuation) -> Int in
+      continuation.resume(returning: 42)
+      return 1
+    } cancel: { _ in
+      XCTFail("cancel should not be called for an operation that is not cancelled")
+    }
+    XCTAssertEqual(result, 42)
+  }
+
+  func testWithCancellableCheckedThrowingContinuationCancelReceivesHandle() async throws {
+    let continuationBox = ThreadSafeBox<CancellableContinuation<Int>?>(initialValue: nil)
+    let operationStarted = self.expectation(description: "operation started")
+    let cancelCalled = self.expectation(description: "cancel called")
+
+    let task = Task {
+      try await withCancellableCheckedThrowingContinuation { (continuation) -> Int in
+        continuationBox.withLock { $0 = continuation }
+        operationStarted.fulfill()
+        return 7
+      } cancel: { handle in
+        XCTAssertEqual(handle, 7)
+        cancelCalled.fulfill()
+      }
+    }
+    try await fulfillmentOfOrThrow(operationStarted)
+    task.cancel()
+    try await fulfillmentOfOrThrow(cancelCalled)
+
+    // Cancellation only invokes `cancel`; the awaiting task is resumed by the operation's result.
+    continuationBox.value?.resume(returning: 42)
+    let result = try await task.value
+    XCTAssertEqual(result, 42)
+  }
 }
