@@ -107,6 +107,12 @@ extension Task where Failure == Never {
     /// The awaiting task is suspended and has not been resumed.
     case waiting(CheckedContinuation<Success, any Error>)
 
+    /// The awaiting task has been resumed with a `CancellationError`.
+    ///
+    /// The operation may still deliver a result that raced with the cancellation. That result is
+    /// discarded because the awaiting task is already resumed.
+    case cancelled
+
     /// The awaiting task has been resumed.
     case resumed
   }
@@ -129,20 +135,27 @@ extension Task where Failure == Never {
 
   /// Resume the awaiting task with the result of the operation.
   ///
+  /// If the awaiting task was cancelled it is already resumed, in which case `result` is discarded.
+  ///
   /// - Precondition: Must be called at most once.
   public func resume<Failure: Error>(with result: Result<Success, Failure>) {
-    let continuation = state.withLock { state -> CheckedContinuation<Success, any Error> in
+    let continuation = state.withLock { state -> CheckedContinuation<Success, any Error>? in
       switch state {
       case .notStarted:
         preconditionFailure("CancellableContinuation was resumed before it was started")
       case .waiting(let continuation):
         state = .resumed
         return continuation
+      case .cancelled:
+        // The result raced with the cancellation of the awaiting task, which has already been
+        // resumed with a `CancellationError`. Nobody is interested in the result anymore.
+        state = .resumed
+        return nil
       case .resumed:
         preconditionFailure("CancellableContinuation was resumed twice")
       }
     }
-    continuation.resume(with: result)
+    continuation?.resume(with: result)
   }
 
   /// Resume the awaiting task by returning `value`.
@@ -158,6 +171,22 @@ extension Task where Failure == Never {
   public func resume(throwing error: any Error) {
     resume(with: Result<Success, any Error>.failure(error))
   }
+
+  /// Resume the awaiting task by throwing a `CancellationError`, unless it has already been resumed.
+  ///
+  /// Unlike ``resume(with:)`` this may be called repeatedly because cancellation is observed both
+  /// through `withTaskCancellationHandler` and by re-checking `Task.isCancelled` once the operation
+  /// has been started.
+  fileprivate func cancel() {
+    let continuation = state.withLock { state -> CheckedContinuation<Success, any Error>? in
+      guard case .waiting(let continuation) = state else {
+        return nil
+      }
+      state = .cancelled
+      return continuation
+    }
+    continuation?.resume(throwing: CancellationError())
+  }
 }
 
 /// Allows the execution of a cancellable operation that returns the results
@@ -166,7 +195,11 @@ extension Task where Failure == Never {
 /// `operation` must invoke the continuation's `resume` method exactly once.
 ///
 /// If the task executing `withCancellableCheckedThrowingContinuation` gets
-/// cancelled, `cancel` is invoked with the handle that `operation` provided.
+/// cancelled, `cancel` is invoked with the handle that `operation` provided and
+/// the awaiting task is resumed with a `CancellationError` without waiting for
+/// `operation` to deliver a result. `operation` may never deliver one, eg. while
+/// it waits for a reply from an unresponsive peer. A result that arrives after
+/// the cancellation is discarded.
 @_spi(SourceKitLSP) public func withCancellableCheckedThrowingContinuation<Handle: Sendable, Success: Sendable>(
   _ operation: (_ continuation: CancellableContinuation<Success>) -> Handle,
   cancel: @Sendable (Handle) -> Void
@@ -182,6 +215,7 @@ extension Task where Failure == Never {
     if let handle = handleWrapper.takeValue() {
       cancel(handle)
     }
+    continuation.cancel()
   }
 
   return try await withTaskCancellationHandler(

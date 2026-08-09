@@ -207,9 +207,13 @@ final class AsyncUtilsTests: XCTestCase {
     task.cancel()
     try await fulfillmentOfOrThrow(cancelCalled)
 
-    // Cancellation only invokes `cancel`; the awaiting task is resumed by the operation's result.
+    // Cancellation resumes the awaiting task without waiting for the operation to deliver a result.
+    await assertThrowsError(try await task.value) { error in
+      XCTAssert(error is CancellationError, "Received unexpected error \(error)")
+    }
+
+    // A result that the operation delivers after the cancellation is discarded instead of resuming
+    // the awaiting task a second time.
     continuationBox.value?.resume(returning: 42)
-    let result = try await task.value
-    XCTAssertEqual(result, 42)
   }
 }
